@@ -1,0 +1,84 @@
+# The app with the AVF GPU renderer (libgfxstream_backend.so) in its jniLibs. No Apple files.
+name: apk-gfx
+
+on:
+  workflow_dispatch:
+    inputs:
+      kernel_ref:
+        description: Scion-Project/scion-kernel branch, tag or commit
+        default: main
+
+env:
+  ANDROID_NDK_VERSION: "28.2.13676358"
+  ANDROID_PLATFORM: "platforms;android-36"
+  ANDROID_BUILD_TOOLS: "build-tools;36.0.0"
+
+jobs:
+  apk:
+    runs-on: macos-15-intel
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v4.2.2
+        with:
+          submodules: true
+
+      - uses: actions/setup-java@v4.7.0
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - uses: android-actions/setup-android@v3.2.2
+        with:
+          packages: platform-tools
+
+      - name: Install NDK r28 + platform + build-tools
+        run: |
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager --install "ndk;${ANDROID_NDK_VERSION}" "$ANDROID_PLATFORM" "$ANDROID_BUILD_TOOLS" "platform-tools"
+          echo "ANDROID_NDK_HOME=$ANDROID_SDK_ROOT/ndk/${ANDROID_NDK_VERSION}" >> "$GITHUB_ENV"
+
+      - name: Install host build tools (Homebrew)
+        run: brew install meson ninja pkgconf cmake
+
+      - name: libgfxstream_backend.so (scion-kernel tools/gfxstream/mk-host-android.sh)
+        env:
+          KERNEL_REF: ${{ inputs.kernel_ref }}
+        run: |
+          git clone -q --filter=blob:none https://github.com/Scion-Project/scion-kernel.git "$RUNNER_TEMP/k"
+          git -C "$RUNNER_TEMP/k" checkout -q "$KERNEL_REF"
+          HAKIOS="$RUNNER_TEMP/k" ANDROID_NDK="$ANDROID_NDK_HOME" native/fetch-gfxstream.sh
+
+      - name: Point Gradle at the SDK
+        run: echo "sdk.dir=$ANDROID_SDK_ROOT" > local.properties
+
+      - name: Cache dependency tarballs
+        uses: actions/cache@v4.2.0
+        with:
+          path: native/build/dl
+          key: deps-dl-${{ runner.os }}-${{ hashFiles('native/build-android.sh') }}
+
+      - name: Cache static sysroot
+        id: sysroot-cache
+        uses: actions/cache@v4.2.0
+        with:
+          path: native/build/sysroot
+          key: deps-sysroot-${{ runner.os }}-${{ github.event.repository.name }}-${{ hashFiles('native/build-android.sh') }}
+
+      - uses: gradle/actions/setup-gradle@v4.2.2
+
+      - name: Build static deps (skipped on sysroot cache hit)
+        if: steps.sysroot-cache.outputs.cache-hit != 'true'
+        run: native/build-android.sh deps
+
+      - name: Build QEMU (cross-build)
+        run: native/build-android.sh qemu
+
+      - name: Assemble debug APK
+        run: ./gradlew --no-daemon assembleDebug
+
+      - uses: actions/upload-artifact@v4.6.0
+        with:
+          name: scion-apk-gfx
+          path: app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
+          retention-days: 7
