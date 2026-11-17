@@ -18,6 +18,7 @@
  *
  * Built by native/build-android.sh into jniLibs as libscnet.so, with the static libslirp and glib.
  */
+#define _GNU_SOURCE             /* pipe2 */
 #include <android/log.h>
 #include <arpa/inet.h>
 #include <errno.h>
