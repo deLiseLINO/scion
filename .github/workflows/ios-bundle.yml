@@ -37,7 +37,7 @@ env:
 
 jobs:
   apk:
-    runs-on: macos-14
+    runs-on: macos-15
     timeout-minutes: 150
     steps:
       - name: The passphrase is set (checked here too, before an hour of building)
