@@ -7,6 +7,7 @@ import io.github.dylanneve1.iosonpixel.avf.AvfApi
 import io.github.dylanneve1.iosonpixel.avf.AvfException
 import io.github.dylanneve1.iosonpixel.avf.AvfIo
 import io.github.dylanneve1.iosonpixel.avf.Scfb
+import io.github.dylanneve1.iosonpixel.avf.Scnet
 import io.github.dylanneve1.iosonpixel.avf.SccamCamera
 import io.github.dylanneve1.iosonpixel.avf.ScfbBattery
 import io.github.dylanneve1.iosonpixel.avf.ScfbIo
@@ -56,13 +57,14 @@ class AvfBackend(
         paths.prepare()
         val spec = AvfLayout(dir).spec(settings)
         log("$ avf " + describe(spec))
-        val run = AvfVm.start(app, spec, io, paths.avfLogFile, log) ?: return null
+        val net: (() -> Scnet)? = if (spec.network) ({ Scnet(QemuNet.Resolver(app, paths, log), paths.resolvConf, log) }) else null
+        val run = AvfVm.start(app, spec, io, paths.avfLogFile, log, net) ?: return null
         // A VM given the display devices that dies at once: crosvm (or SELinux) refused them.
         if (io.configured) run.stoppedEarly(EARLY_STOP_MS)?.let { reason ->
             val text = ScfbIo.UNAVAILABLE + "the VM stopped at start with the display devices ($reason)"
             log("avf: $text; booting again console-only")
             VmState.notice("$text. The VM booted console-only.")
-            return AvfVm.start(app, spec, AvfIo.None, paths.avfLogFile, log)
+            return AvfVm.start(app, spec, AvfIo.None, paths.avfLogFile, log, net)
         }
         return run
     }
@@ -97,7 +99,7 @@ class AvfBackend(
         append(" mem=").append(s.memoryBytes / (1024 * 1024)).append("M")
         append(" cpus=").append(if (s.matchHostCpus) "host" else "1")
         s.gpu?.let { append(" gpu=").append(it.backend).append(":").append(it.contextTypes.joinToString(",")) }
-        if (s.network) append(" net=tap")
+        if (s.network) append(" net=vsock:").append(Scnet.PORT)
         if (s.audio) append(" audio")
         append(" params=\"").append(s.params.joinToString(" ")).append('"')
     }
@@ -177,27 +179,19 @@ object AvfSupport {
                 (if (network) AvfApi.NETWORK_EXEMPTIONS else emptyList())).joinToString(",").replace("$", "\\$") + "'\""
 
     /**
-     * The Network setting's readiness: the builder call, and virtualizationservice's network
-     * feature (vmnic and VM tethering). Blocking: a VM asked to have a network that the service
-     * can't give one fails to start.
+     * The Network setting's readiness: the stream to the guest (VirtualMachine.connectVsock) and
+     * the network stack at this end of it (libscnet.so). Blocking: the guest would show Wi-Fi with
+     * nothing behind it.
      */
     fun networkCheck(ctx: Context, display: Boolean = false): VmBackend.Check {
         val api = AvfApi.instance
-        if (!api.present || !api.networkSupported) {
-            return VmBackend.Check(false, "Network: this Android's AVF has no network option for custom VMs (useNetwork); turn Network off")
+        if (api.present && !api.vsockSupported) {
+            return VmBackend.Check(false, "Network: VirtualMachine.connectVsock is blocked by the hidden-API policy. " +
+                "Widen the exemption (a global setting), then restart the app:\n  " +
+                exemptionCommand(display, network = true) + "\n  adb shell am force-stop ${ctx.packageName}")
         }
-        val manager = runCatching { api.manager(ctx) }.getOrNull()
-        return when (manager?.let { api.networkFeature(it) }) {
-            true -> VmBackend.Check(true, "Network: AVF gives the VM a virtio-net card on the phone's connection")
-            false -> VmBackend.Check(false, "Network: this device's virtualization service is built without networking " +
-                "(${AvfApi.FEATURE_NETWORK}); turn Network off")
-            // Not knowing is no reason to refuse: the VM asks for the card and the log has Android's answer.
-            null -> VmBackend.Check(false, "Network: the app can't ask whether AVF has networking (hidden-API policy), " +
-                "so the VM asks for a network card anyway and the log shows Android's answer. To have it asked here, " +
-                "widen the exemption (a global setting), then restart the app:\n  " +
-                exemptionCommand(display, network = true) + "\n  adb shell am force-stop ${ctx.packageName}",
-                blocking = false)
-        }
+        Scnet.unavailable?.let { return VmBackend.Check(false, "Network: this build has no network stack for the guest ($it); turn Network off") }
+        return VmBackend.Check(true, "Network: the guest's Wi-Fi is this app's connection (slirp over a virtio socket)")
     }
 
     /**
@@ -318,7 +312,8 @@ class AvfLayout(val dir: File) {
         initrd = initrd?.absolutePath,
         // The Extra arguments setting comes after the folder's params; the Security setting wins
         // over any security= in either.
-        params = (params + s.extraArgList).filter { !it.startsWith("${Security.BOOT_ARG}=") } + s.security.bootArg,
+        params = (params + s.extraArgList).filter { !it.startsWith("${Security.BOOT_ARG}=") } + s.security.bootArg +
+            (if (s.avfNetwork) listOf(Scnet.BOOT_ARG) else emptyList()),
         disks = disks.map { AvfApi.Disk(it.file.absolutePath, it.writable) },
         memoryBytes = (memoryMib ?: (s.ramGb * 1024L)) * 1024 * 1024,
         matchHostCpus = cpus?.let { it == "host" } ?: (s.smp > 1),
@@ -359,6 +354,8 @@ class AvfVm private constructor(
     private val io: AvfIo,
     private val logFile: File,
     private val log: (String) -> Unit,
+    /** The guest's network, if the Network setting is on: started once the VM runs, stopped with it. */
+    private val net: Scnet?,
 ) : VmBackend.Instance {
     enum class State { CREATING, STARTING, RUNNING, STOPPING, STOPPED }
 
@@ -402,11 +399,7 @@ class AvfVm private constructor(
                     stopped.countDown()
                 }
 
-                override fun onError(code: Int, message: String) {
-                    log("avf: error ${api.errorName(code)}: $message")
-                    if (spec.network) log("avf: network: the VM was asked to have a network card (Network is on): " +
-                        "if this error is about it, that is Android's answer; turn Network off to boot without one")
-                }
+                override fun onError(code: Int, message: String) = log("avf: error ${api.errorName(code)}: $message")
 
                 override fun onEvent(name: String) = log("avf: $name")
             })
@@ -415,20 +408,16 @@ class AvfVm private constructor(
             console = runCatching { v.consoleOutput() }.onFailure { log("avf: no console output: ${it.message}") }.getOrNull()
             vmLog = runCatching { v.logOutput() }.getOrNull()
             screen = io.attach(v, log)
+            net?.start(v)
             // onStopped may already have arrived (a guest that exits at once); keep STOPPED then.
             if (stopped.count > 0) state(State.RUNNING)
-            if (spec.network) log("avf: network: Android accepted useNetwork: the guest has a virtio-net card on its VM tethering")
             return true
         } catch (e: AvfException) {
             log("error: AVF: ${e.message}")
             // virtmgr checks the grants itself, so a missing one surfaces as a SecurityException here.
             if (e.cause is SecurityException) log("error: check the MANAGE_ and USE_CUSTOM_VIRTUAL_MACHINE grants (see the checks on the main screen)")
-            if (spec.network) log("error: Network is on: the VM asked for a network card (useNetwork); if the error above " +
-                "is about it, that is Android's answer. Turn Network off to boot without one")
         } catch (e: RuntimeException) {
             log("error: AVF: $e")
-            if (spec.network) log("error: Network is on: the VM asked for a network card (useNetwork); if the error above " +
-                "is about it, that is Android's answer. Turn Network off to boot without one")
         }
         state(State.STOPPED)
         stopped.countDown()
@@ -513,6 +502,7 @@ class AvfVm private constructor(
     private fun cleanup() {
         if (!cleaned.compareAndSet(false, true)) return
         runCatching { io.detach() }
+        runCatching { net?.stop() }
         screen = null
         vm?.let { v ->
             runCatching { v.close() }
@@ -539,13 +529,14 @@ class AvfVm private constructor(
             private set
 
         /** Builds, creates and runs [spec]; null (reason logged) if any step fails. */
-        fun start(ctx: Context, spec: AvfApi.Spec, io: AvfIo, logFile: File, log: (String) -> Unit): AvfVm? {
+        fun start(ctx: Context, spec: AvfApi.Spec, io: AvfIo, logFile: File, log: (String) -> Unit,
+                  net: (() -> Scnet)? = null): AvfVm? {
             val api = AvfApi.instance
             val manager = api.manager(ctx) ?: run {
                 log("error: AVF: no VirtualMachineManager on this device")
                 return null
             }
-            val run = AvfVm(api, manager, io, logFile, log)
+            val run = AvfVm(api, manager, io, logFile, log, net?.invoke())
             current = run
             return run.takeIf { it.boot(ctx, spec) }
         }
