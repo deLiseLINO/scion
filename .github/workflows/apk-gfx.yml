@@ -9,7 +9,7 @@ on:
         default: main
       kernel_repo:
         description: GitHub repository of the kernel (owner/name)
-        default: Scion-Project/scion-kernel
+        default: deLiseLINO/scion-kernel
 
 env:
   ANDROID_NDK_VERSION: "28.2.13676358"

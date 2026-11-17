@@ -24,7 +24,7 @@ on:
         default: main
       kernel_repo:
         description: GitHub repository of the kernel (owner/name)
-        default: Scion-Project/scion-kernel
+        default: deLiseLINO/scion-kernel
       params:
         description: Extra boot-arguments appended to avf.properties' params (optional)
         default: ""
