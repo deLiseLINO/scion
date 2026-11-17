@@ -2,60 +2,53 @@
 
 ## AVF backend (iOS 16.5 on HackiOS's XNU): the "Network" setting
 
-*Added 2026-10-22. Everything below the next heading is about the QEMU backend.*
+*Added 2026-10-22, reworked 2026-11-17. Everything below the next heading is about the QEMU backend.*
 
-**What AVF offers on the Pixel 10 (Android 17, DP11.260918.006):** custom VMs can ask for a
-network card with `VirtualMachineCustomImageConfig.Builder.useNetwork(true)`. The member is
-`@hide`, but the existing hidden-API exemption (`Landroid/system/virtualmachine/VirtualMachineCustomImageConfig`)
-already covers it. virtualizationservice then makes a TAP with `vmnic` (`avf_tap_<suffix>`) and
-asks the system's `IVmTethering` service (service-virtualization.jar) to start tethering of type 7
-(TETHERING_VIRTUAL) on it, so Android's tethering supplies DHCP, DNS and NAT. crosvm puts a
-virtio-net-pci card on that TAP. The Terminal app (Linux VM) uses exactly this: its config only
-sets `useNetwork`. On this phone `/apex/com.android.virt/bin/vmnic` exists and
-`android.system.vmtethering.IVmTethering` is published, so the feature is built in.
-`VirtualMachineManager.isFeatureEnabled("com.android.kvm.NETWORK")` reports it.
+**Why not AVF's own network card.** Custom VMs can ask for one with
+`VirtualMachineCustomImageConfig.Builder.useNetwork(true)`: virtualizationservice makes a TAP with
+`vmnic` and has Android's VM tethering serve it, and crosvm gets `--net`. On the Pixel 7
+(Android 17, CP3A.261005.002.A1) virtmgr and the tethering do their part, but the phone's own
+crosvm (signed APEX, not replaceable) stops at start: `crosvm: arg parsing failed: Unrecognized
+argument: --net`, exit 35. So the app no longer asks for it.
 
-**Not yet verified on the phone:** whether virtualizationservice accepts `useNetwork` from a
-sideloaded app holding MANAGE_VIRTUAL_MACHINE, USE_CUSTOM_VIRTUAL_MACHINE and INTERNET (the Terminal is a
-privileged app). Nothing is bypassed: if it refuses, the VM fails to start with the framework's
-error in the app's log. The fallback then is a user-mode network stack in the app (libslirp or
-gvisor-tap-vsock style) carrying Ethernet frames over virtio-vsock (`connectVsock`), with a vsock
-link driver behind HackiOS's `redwood_net` in the guest.
+**What Scion does instead.** Every AVF guest has a virtio socket device (crosvm's vhost-vsock;
+on the Pixel 7 it is PCI 00:08.0, `1af4:1053`). With **Network** on (Settings › Advanced, per
+install, off by default; developer hook `--ez avf_network true`):
 
-**What Scion does:** Settings › Advanced › **Network** (per install, off by default). When it's
-on, the app adds the INTERNET permission's use, calls `useNetwork(true)`, and shows a check line
-for AVF's network feature. When it's off, the VM is exactly as before: no card.
+1. the app adds boot-arg `virtio_net_vsock=5601`, and the guest kernel (scion-kernel
+   `drivers/virtio/hakios.virtio_net.c`) puts en0 on a stream it listens for on vsock port 5601,
+   instead of on a virtio-net card;
+2. once the VM runs, the app connects to that port (`VirtualMachine.connectVsock`, retried every
+   second until the guest listens; `avf/Scnet.kt`) and hands the socket to libslirp
+   (`native/scnet.c`, built as `libscnet.so` by `native/build-android.sh` with the same libslirp
+   as QEMU's). slirp answers DHCP (10.0.2.15/24, router 10.0.2.2, DNS 10.0.2.3) and opens the
+   guest's TCP and UDP connections as this app's own sockets, so they go out on whatever network
+   the phone has. DNS goes to the phone's servers through `SLIRP_RESOLV_CONF` and
+   `QemuNet.Resolver`, as for QEMU (below). The phone's 127.0.0.1 is closed to the guest.
 
-**The guest side** (scion-kernel, `bsd/dev/redwood_virtio_net.c`): HackiOS's virtio-net
-driver runs on the virtio-pci transport. With boot-arg `virtio_net_wifi=1` (in the kernel repo's
-`avf/scion/avf.properties`), en0 is presented to iOS as **Wi-Fi**, the way the phone build presents
-its ath11k radio: RedwoodWLAN's IOKit entries, Apple80211 ioctls answered in the kernel, and a
-virtual station that hears one open network, **"Scion"**, and joins it at boot. configd makes a
-Wi-Fi network service and runs DHCP itself; Settings › Wi-Fi shows "Scion". Without the boot-arg
-the card is a wired en0 that iOS doesn't configure by itself (HackiOS's `net_test dhcp en0`
-does it on QEMU).
+**The stream's one structure**, both ways, for as long as the connection lasts:
 
-**Verified on QEMU (Mac, hvf, 2026-10-23):** `NET=1 avf/qemu-scfb.sh` (virtio-net-pci on
-`-netdev user`) with the new kernel. iOS shows the Wi-Fi icon in the status bar, and Settings ›
-Wi-Fi shows "Scion" ticked as an Unsecured Network. The DHCP lease is 10.0.2.15/24 with router
-10.0.2.2, and Safari loads google.com over HTTPS. One requirement: configd has to be among
-the launchd jobs. A root.apfs built without `REST=1` has no configd, so nothing runs DHCP.
-`common/build.sh` builds with `REST=1`; also check `mkjobs.py --rest` writes one plist per job
-(fixed in hackios-xnu-userland: before the fix, all the on-demand jobs were written to one file
-named `RWA_PACKED16`).
+```
+u32 length, big-endian, 1..1514 | that many bytes: one Ethernet frame (no checksum)
+```
 
-**Turning it on** (needs a kernel with the virtual station: scion-kernel main after the
-`avf/net-wifi` merge):
+(QEMU's `-netdev stream` framing.) vsock cuts the bytes into packets as it likes, so each end
+puts frames back together; a length out of range ends the connection, and the app connects
+again. The guest's side keeps the vsock credit rules (it tells the peer 256 KiB of room and
+drops a frame when the app's room is used up; TCP sends it again).
 
-1. Rebuild install 2's `payload.bin` from that kernel and push it with `avf/scion/install-ios165.sh`
-   (it also pushes the new `avf.properties`). Or keep the old `avf.properties` and put
-   `virtio_net_wifi=1` in the install's **Extra arguments**.
-2. In Scion, pick install 2, open Advanced, turn on **Network**, start the VM.
-3. Developer hook for one session: `--ez avf_network true` (with `--es backend avf --es vm_dir ...`).
+**What iOS sees.** With `virtio_net_wifi=1` (in `avf/scion/avf.properties`), en0 is presented as
+**Wi-Fi**, whichever link carries its frames: RedwoodWLAN's IOKit entries, Apple80211 ioctls
+answered in the kernel, and a virtual station that hears one open network, **"Scion"**, and joins
+it at boot. configd makes a Wi-Fi network service and runs DHCP itself (it must be among the
+launchd jobs: a root.apfs built with `REST=1`). Verified on QEMU with a virtio-net card
+(2026-10-23, `NET=1 avf/qemu-scfb.sh`): lease 10.0.2.15, Safari loads google.com.
 
-Check the console for `net: virtio network device on ...`, `net: en0 attached ... (a radio)` and
-`net: en0 is a radio (virtio_net_wifi=1): one open network, "Scion"`. On the Android side,
-`adb shell ip addr` shows an `avf_tap_*` interface while the VM runs.
+**Checking it.** The guest console has `net: virtio socket device on pci 00:08.0: guest cid N,
+the app's frames on port 5601`, `net: en0 is a radio (virtio_net_wifi=1) ...` and, once the app is
+there, `net: vsock: the app connected from cid 2 port ...`. The app's log has `avf: network:
+connected to the guest on vsock port 5601` and, when a stream ends, why, with frame counts
+(logcat tag `scnet` too). The USB console's `wifi stat` shows the link's counts.
 
 
 The emulated iPhone 11 (t8030, iOS 14.0) boots to SpringBoard on a Pixel 10, but

@@ -2,10 +2,11 @@
 # Cross-compiles the Inferno QEMU fork (and its dependencies) for Android arm64,
 # tuned for Tensor G5, and drops the result into app/src/main/jniLibs.
 #
-# Usage: native/build-android.sh [deps|qemu|qemu-lib|all]   (default: all)
+# Usage: native/build-android.sh [deps|qemu|qemu-lib|scnet|all]   (default: all)
 #
 # `qemu` builds the executable and, unless NO_QEMU_LIB=1, also the in-process
-# variant: QEMU as a shared library plus the JNI shim that calls it.
+# variant: QEMU as a shared library plus the JNI shim that calls it. It also
+# builds libscnet.so, the AVF backend's guest network (libslirp, native/scnet.c).
 #
 # Env overrides:
 #   ANDROID_NDK_HOME  NDK root (default: newest under ~/Library/Android/sdk/ndk)
@@ -391,6 +392,17 @@ build_qemu() {
   cp "$NATIVE/keymaps/en-us" "$ASSET_OUT/keymaps/"
   echo "installed $JNI_OUT/libqemu-system-aarch64.so"
   [[ -n "${NO_QEMU_LIB:-}" ]] || build_qemu_lib
+  build_scnet
+}
+
+# The AVF backend's guest network (native/scnet.c, docs/NETWORKING.md): libslirp at one end of
+# a virtio socket stream to the guest, as a JNI library. Needs only the static sysroot.
+build_scnet() {
+  # shellcheck disable=SC2046
+  "$CC" $OPT_CFLAGS -Wall -Wextra -Werror -shared -Wl,-z,max-page-size=16384 -Wl,--no-undefined -Wl,--gc-sections \
+    -o "$JNI_OUT/libscnet.so" "$NATIVE/scnet.c" $("$PKG_CONFIG" --cflags --libs slirp) -llog
+  "$STRIP" "$JNI_OUT/libscnet.so"
+  echo "installed $JNI_OUT/libscnet.so"
 }
 
 # The in-process variant (app setting "Run QEMU in-process"): the same QEMU as
@@ -437,8 +449,9 @@ case "${1:-all}" in
   deps) build_deps ;;
   qemu) build_qemu ;;
   qemu-lib) build_qemu_lib ;;
+  scnet) build_scnet ;;
   pgo-merge) shift; pgo_merge "$@" ;;
   all) build_deps; build_qemu ;;
   gmp|nettle|tasn1|lz4|lzfse|glib|libslirp|pixman) "build_$1" ;;
-  *) echo "usage: $0 [deps|qemu|qemu-lib|all|pgo-merge|gmp|nettle|tasn1|lz4|lzfse|glib|libslirp|pixman]" >&2; exit 2 ;;
+  *) echo "usage: $0 [deps|qemu|qemu-lib|scnet|all|pgo-merge|gmp|nettle|tasn1|lz4|lzfse|glib|libslirp|pixman]" >&2; exit 2 ;;
 esac

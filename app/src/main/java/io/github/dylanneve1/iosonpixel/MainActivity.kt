@@ -574,8 +574,8 @@ class MainActivity : Activity() {
         }
         avfNetwork = switch(
             advanced, "Network",
-            "AVF only: the guest gets a network card on the phone's connection (Wi-Fi or mobile data), " +
-                "through the network Android sets up for virtual machines. Off: no network.", s.avfNetwork,
+            "AVF only: iOS gets Wi-Fi on the phone's connection (Wi-Fi or mobile data), through this app's " +
+                "own network stack (slirp). Off: no network.", s.avfNetwork,
         )
         avfNetwork.setOnCheckedChangeListener { _, checked ->
             if (filling) return@setOnCheckedChangeListener
