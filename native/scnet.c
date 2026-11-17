@@ -236,7 +236,7 @@ static bool from_guest(struct session *s, const uint8_t *p, size_t n)
         p += take;
         n -= take;
         if (s->have == want && want > PREFIX) {
-            s->frames_in++;
+            if (s->frames_in++ == 0) LOG("the guest's first frame: %u bytes", want - PREFIX);
             s->bytes_in += want - PREFIX;
             slirp_input(s->slirp, s->frame + PREFIX, (int)(want - PREFIX));
             s->have = 0;
@@ -267,12 +267,22 @@ static void run_timers(struct session *s)
 static void loop(struct session *s)
 {
     static uint8_t buffer[READ_SIZE];
+    int64_t said_at = now_ms();
+    uint64_t said = 0;
 
     while (s->ended == NULL) {
         uint32_t timeout = 1000;
         int64_t now = now_ms();
         int ready;
 
+        /* to logcat every 30 s while frames move: whether the guest talks at all */
+        if (now - said_at >= 30000 && s->frames_in + s->frames_out != said) {
+            said = s->frames_in + s->frames_out;
+            said_at = now;
+            LOG("%llu frames from the guest (%llu bytes), %llu to it (%llu bytes)",
+                (unsigned long long)s->frames_in, (unsigned long long)s->bytes_in,
+                (unsigned long long)s->frames_out, (unsigned long long)s->bytes_out);
+        }
         s->npfds = 0;
         add_poll(s->fd, SLIRP_POLL_IN, s);              /* index 0: the guest */
         add_poll(wake_fds[0], SLIRP_POLL_IN, s);        /* index 1: stop() and slirp's notify */
