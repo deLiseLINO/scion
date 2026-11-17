@@ -5,8 +5,11 @@ on:
   workflow_dispatch:
     inputs:
       kernel_ref:
-        description: Scion-Project/scion-kernel branch, tag or commit
+        description: scion-kernel branch, tag or commit (of kernel_repo)
         default: main
+      kernel_repo:
+        description: GitHub repository of the kernel (owner/name)
+        default: Scion-Project/scion-kernel
 
 env:
   ANDROID_NDK_VERSION: "28.2.13676358"
@@ -43,8 +46,9 @@ jobs:
       - name: libgfxstream_backend.so (scion-kernel tools/gfxstream/mk-host-android.sh)
         env:
           KERNEL_REF: ${{ inputs.kernel_ref }}
+          KERNEL_REPO: ${{ inputs.kernel_repo }}
         run: |
-          git clone -q --filter=blob:none https://github.com/Scion-Project/scion-kernel.git "$RUNNER_TEMP/k"
+          git clone -q --filter=blob:none "https://github.com/$KERNEL_REPO.git" "$RUNNER_TEMP/k"
           git -C "$RUNNER_TEMP/k" checkout -q "$KERNEL_REF"
           HAKIOS="$RUNNER_TEMP/k" ANDROID_NDK="$ANDROID_NDK_HOME" native/fetch-gfxstream.sh
 
